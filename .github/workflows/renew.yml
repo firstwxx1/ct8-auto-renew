@@ -1,0 +1,51 @@
+name: CT8 Auto Renew
+
+on:
+  # every 7 days at 03:17 UTC. CT8 suspends accounts for inactivity, and a
+  # panel login is what resets that clock - so well inside any window.
+  schedule:
+    - cron: "17 3 */7 * *"
+  workflow_dispatch:      # lets you trigger a run by hand from the Actions tab
+
+permissions:
+  contents: write         # needed for the keepalive commit below
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No npm install, no puppeteer, no xvfb. renew.py is stdlib-only.
+      - name: Renew CT8 accounts
+        env:
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python renew.py
+
+      # GitHub disables scheduled workflows after ~60 days of repo inactivity.
+      # Committing a timestamp on every run keeps the repo "active" so the
+      # cron keeps firing. This is the part most forks get wrong.
+      - name: Keep repo active
+        if: always()
+        run: |
+          date -u +"%Y-%m-%d %H:%M:%S UTC" > last_run.txt
+          git config user.name "ct8-renew bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add last_run.txt
+          if git diff --quiet --cached; then
+            echo "no change to commit"
+          else
+            git commit -m "chore: renew run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push
+          fi
