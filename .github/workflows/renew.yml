@@ -1,14 +1,20 @@
 name: CT8 Auto Renew
 
 on:
-  # every 7 days at 03:17 UTC. CT8 suspends accounts for inactivity, and a
-  # panel login is what resets that clock - so well inside any window.
+  # Every Monday 03:17 UTC - a true 7-day cadence. (The previous "17 3 */7 * *"
+  # meant day-of-month stepped by 7, i.e. the 1st/8th/15th/22nd/29th, leaving a
+  # 3-day gap across month-end. Harmless, but not what it said.)
   schedule:
-    - cron: "17 3 */7 * *"
+    - cron: "17 3 * * 1"
   workflow_dispatch:      # lets you trigger a run by hand from the Actions tab
 
 permissions:
   contents: write         # needed for the keepalive commit below
+
+# Never let a manual run race the scheduled one on the keepalive push.
+concurrency:
+  group: ct8-renew
+  cancel-in-progress: false
 
 jobs:
   renew:
@@ -25,6 +31,7 @@ jobs:
           python-version: "3.12"
 
       # No npm install, no puppeteer, no xvfb. renew.py is stdlib-only.
+      # The job's colour reflects THIS step - the renewal - and nothing else.
       - name: Renew CT8 accounts
         env:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
@@ -33,10 +40,15 @@ jobs:
         run: python renew.py
 
       # GitHub disables scheduled workflows after ~60 days of repo inactivity.
-      # Committing a timestamp on every run keeps the repo "active" so the
-      # cron keeps firing. This is the part most forks get wrong.
+      # Committing a timestamp keeps the repo "active" so the cron keeps firing.
+      #
+      # continue-on-error: a failed push here must NOT paint a successful
+      # renewal red. Bookkeeping and renewal are separate signals; only the
+      # renewal is allowed to fail the job. The retry loop absorbs transient
+      # network trouble.
       - name: Keep repo active
         if: always()
+        continue-on-error: true
         run: |
           date -u +"%Y-%m-%d %H:%M:%S UTC" > last_run.txt
           git config user.name "ct8-renew bot"
@@ -44,8 +56,18 @@ jobs:
           git add last_run.txt
           if git diff --quiet --cached; then
             echo "no change to commit"
-          else
-            git commit -m "chore: renew run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git pull --rebase origin "${GITHUB_REF_NAME}" || true
-            git push
+            exit 0
+          fi
+          git commit -m "chore: renew run $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ok=0
+          for i in 1 2 3; do
+            if git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push; then
+              ok=1
+              break
+            fi
+            echo "push attempt $i failed; retrying in $((i*5))s"
+            sleep $((i*5))
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::warning::keepalive push failed after 3 attempts (renewal itself is unaffected)"
           fi

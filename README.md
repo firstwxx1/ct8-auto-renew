@@ -22,8 +22,13 @@ POST /login/
 `lopins/serv00-auto-scripts` 用 `headless: false` 跑 Chrome，CI 里必须套 `xvfb-run`，
 又重又慢。这里全标准库，一次跑完不到两秒。
 
-登录成功判定：落地页含 `/logout/` 且不再有 `data-login-form`。
-（和原版 puppeteer 判定 `a[href="/logout/"]` 一致。）
+登录成功判定（**正向判定，抗页面改版**）：
+
+1. 落地页含 `/logout/` 且不含 `data-login-form` —— 主判定；
+2. 或者拿到了 `sessionid` cookie 且不含 `data-login-form` —— 兜底判定。
+
+命中任意一条即视为成功。这样即使 CT8 哪天改了面板样式、把 `/logout/`
+换成图标，也不会把一次**成功**的登录误报成 FAIL。
 
 ## 配置
 
@@ -49,14 +54,29 @@ POST /login/
 
 ## 定时
 
-`17 3 */7 * *` —— 每 7 天 UTC 03:17 跑一次。
+`17 3 * * 1` —— 每周一 UTC 03:17 跑一次，**真正 7 天间隔**。
+（旧值 `17 3 */7 * *` 在「每月第几日」上步进 7，实际命中 1/8/15/22/29 号，
+月末会缩成 3 天。做保活无害，但名不副实。）
 CT8 的停用窗口远长于 7 天，足够安全。想手动触发去 Actions 页点 Run workflow。
 
-## 关键细节：keepalive
+## 关键细节
+
+### keepalive（保活提交）
 
 **GitHub 会在仓库 60 天无活动后自动停用定时任务**，很多 fork 莫名其妙失效就是栽在这。
 本仓库每次跑完都会提交一个 `last_run.txt` 时间戳，仓库有活动，cron 就不会被关掉。
 别把那一步删了。
+
+### 为什么保活那步是 `continue-on-error: true`
+
+保活提交如果失败（网络抖动、rebase 冲突），**不应该把一次成功的续期染红**。
+记账失败和续期失败是两个信号，只允许后者让 job 变红。
+配合 3 次重试，偶发网络问题也能自愈。
+
+### concurrency
+
+`concurrency.group: ct8-renew` 保证手动触发的 run 不会和定时的 run 在
+push 上打架。
 
 ## 本地测试
 
@@ -73,6 +93,10 @@ python renew.py --selftest
 PASS - wrong credentials correctly rejected; csrf + POST + detection work
 ```
 
+## 依赖
+
+零。Python 3.8+ 标准库即可，无需 `pip install`。
+
 ## 免责说明
 
-账号密码只存在 GitHub Secrets 里，不进代码库。仓库设成私有。
+账号密码只存在 GitHub Secrets 里，不进代码库。仓库保持私有。

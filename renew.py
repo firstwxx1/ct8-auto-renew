@@ -12,16 +12,14 @@ HOW IT WORKS (no browser needed)
 --------------------------------
 panel.ct8.pl is a stock Django app behind nginx + Phusion Passenger. The login
 form has no captcha and no Cloudflare challenge, so a plain HTTP POST is
-enough. That is why this script is ~150 lines of stdlib instead of a
-puppeteer + xvfb stack:
+enough. That is why this script is stdlib-only instead of a puppeteer + xvfb
+stack:
 
     GET  /login/?next=/      -> sets csrftoken cookie, form carries
                                 csrfmiddlewaretoken
     POST /login/             -> csrfmiddlewaretoken, username, password, next
-    success                 -> lands on dashboard, which contains /logout/
-
-Verified against the live panel: form fields are exactly
-csrfmiddlewaretoken / username / password / next, posted to /login/.
+    success                  -> lands on the dashboard, which contains
+                                /logout/ and sets a sessionid cookie
 
 USAGE
     export ACCOUNTS_JSON='[{"username":"u","password":"p"}]'
@@ -58,11 +56,13 @@ class LoginFailed(Exception):
 
 
 def build_opener():
-    """Cookie jar + no proxy (avoids any sandbox/CI proxy rewriting the host)."""
-    return urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()),
+    """Cookie jar + no proxy. Returns (opener, jar) so callers can read cookies."""
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
         urllib.request.ProxyHandler({}),
     )
+    return opener, jar
 
 
 def fetch_login_page(opener):
@@ -76,8 +76,14 @@ def fetch_login_page(opener):
     return html, (m.group(1) if m else None)
 
 
-def login(opener, username, password):
-    """Returns (ok: bool, detail: str)."""
+def login(opener, jar, username, password):
+    """Returns (ok: bool, detail: str).
+
+    Success is decided on a POSITIVE signal - a logout link and/or a sessionid
+    cookie with no login form on the page - rather than on one hard-coded
+    marker. A cosmetic dashboard restyle therefore no longer turns a good login
+    into a reportable FAIL.
+    """
     _, token = fetch_login_page(opener)
     if not token:
         return False, "could not read csrfmiddlewaretoken from the login page"
@@ -102,16 +108,22 @@ def login(opener, username, password):
 
     with opener.open(req, timeout=45) as r:
         final_url = r.geturl()
+        status = getattr(r, "status", 200)
         body = r.read().decode("utf-8", "replace")
 
     has_logout = "/logout/" in body
     still_on_form = "data-login-form" in body
+    has_session = any(c.name == "sessionid" for c in jar)
 
     if has_logout and not still_on_form:
-        return True, "logged in, dashboard reached (%s)" % final_url
+        return True, "dashboard reached, logout link present (%s)" % final_url
+    if has_session and not still_on_form:
+        return True, "sessionid cookie set, no login form (%s)" % final_url
     if still_on_form:
-        return False, "panel re-rendered the login form - wrong username or password"
-    return False, "ambiguous response from %s (no logout link, no login form)" % final_url
+        return False, ("panel re-rendered the login form - wrong username/password, "
+                       "or the account is suspended")
+    return False, ("ambiguous response from %s (HTTP %s: no logout link, no login "
+                   "form, no session cookie)" % (final_url, status))
 
 
 def notify(token, chat_id, text):
@@ -121,7 +133,7 @@ def notify(token, chat_id, text):
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
     try:
         req = urllib.request.Request(url, data=data, headers={"User-Agent": UA})
-        opener = build_opener()
+        opener, _ = build_opener()
         with opener.open(req, timeout=20) as r:
             r.read()
         print("  [telegram] sent")
@@ -139,6 +151,8 @@ def load_accounts():
         raise SystemExit("[config] ACCOUNTS_JSON is not valid JSON: %s" % e)
     if isinstance(accounts, dict):
         accounts = [accounts]
+    if not accounts:
+        raise SystemExit("[config] ACCOUNTS_JSON is an empty list")
     for a in accounts:
         if not a.get("username") or not a.get("password"):
             raise SystemExit("[config] every entry needs username and password")
@@ -160,10 +174,15 @@ def main():
 
         for attempt in range(1, 4):
             try:
-                ok, detail = login(build_opener(), user, acct["password"])
+                opener, jar = build_opener()
+                ok, detail = login(opener, jar, user, acct["password"])
                 break
             except urllib.error.HTTPError as e:
-                detail = "HTTP %s" % e.code
+                if e.code in (403, 429):
+                    detail = ("HTTP %s - blocked (IP ban or rate limit); retry from "
+                              "another egress" % e.code)
+                else:
+                    detail = "HTTP %s" % e.code
             except urllib.error.URLError as e:
                 detail = "network error: %s" % e.reason
             except Exception as e:
@@ -193,7 +212,8 @@ def main():
 def selftest():
     """Negative test: bogus credentials must be detected as a failure."""
     print("selftest - posting deliberately wrong credentials to %s" % LOGIN_URL)
-    ok, detail = login(build_opener(), "definitely-not-a-real-user", "wrong-password")
+    opener, jar = build_opener()
+    ok, detail = login(opener, jar, "definitely-not-a-real-user", "wrong-password")
     print("  result: ok=%s  detail=%s" % (ok, detail))
     if ok:
         print("UNEXPECTED: bogus credentials were accepted - detection is broken")
